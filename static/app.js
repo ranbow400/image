@@ -560,25 +560,6 @@ async function pollInstStatus() {
   instTimer = setTimeout(pollInstStatus, 4000);
 }
 
-// ---------- 自然语言转 tag ----------
-$("nlBtn").onclick = async () => {
-  const desc = prompt("输入自然语言描述（如：害羞的绿发女孩穿着连衣裙看向观众）", "");
-  if (!desc) return;
-  $("status").textContent = "转换中...（首次加载模型较慢）";
-  try {
-    const resp = await api("/api/nl2tags", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: desc }),
-    });
-    if (!resp.ok) { $("status").textContent = "转换失败: " + resp.error; return; }
-    const cur = $("prompt").value.trim();
-    $("prompt").value = cur ? cur + ", " + resp.tags : resp.tags;
-    $("status").textContent = "已插入 tag";
-  } catch (e) {
-    $("status").textContent = "转换失败: " + e;
-  }
-};
-
 // ---------- tag 联想 ----------
 let suggestTimer = null;
 let suggestItems = [];

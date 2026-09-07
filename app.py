@@ -223,46 +223,6 @@ def api_tag_suggest():
     return jsonify({"ok": True, "items": pref + sub})
 
 
-NL_MODEL = None
-NL_TOKENIZER = None
-
-
-def _load_nl():
-    global NL_MODEL, NL_TOKENIZER
-    if NL_MODEL is None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "Qwen2.5-1.5B-Instruct")
-        NL_TOKENIZER = AutoTokenizer.from_pretrained(p)
-        NL_MODEL = AutoModelForCausalLM.from_pretrained(p, torch_dtype="auto", device_map="auto")
-    return NL_MODEL, NL_TOKENIZER
-
-
-@app.route("/api/nl2tags", methods=["POST"])
-def api_nl2tags():
-    d = request.get_json(force=True)
-    text = (d.get("text") or "").strip()
-    if not text:
-        return jsonify({"ok": False, "error": "empty"})
-    try:
-        model, tok = _load_nl()
-        sys_prompt = ("把用户的画面描述转换为逗号分隔的英文 danbooru 标签列表。"
-                      "对必须出现的核心画面要素（主体人物、显著外貌特征、核心表情/动作/服装）用双重括号包裹，"
-                      "例如 ((1girl))、((green hair))、((smile))、((dress))；"
-                      "背景氛围等次要要素不加括号。只输出标签列表本身，不要任何解释。"
-                      "例：'绿发女孩穿着连衣裙微笑' -> ((1girl)), ((green hair)), dress, ((smile))")
-        prompt_text = tok.apply_chat_template(
-            [{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
-            tokenize=False, add_generation_prompt=True)
-        inputs = tok(prompt_text, return_tensors="pt")
-        if hasattr(model, "device"):
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        out = model.generate(**inputs, max_new_tokens=256, do_sample=False)
-        resp = tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        return jsonify({"ok": True, "tags": resp.strip()})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
 def enhance_negative(neg: str) -> str:
     """加强负面词：保留用户输入，追加带权重的文字/水印屏蔽词库（已在负面词中的项不重复追加）。"""
     parts = [neg.strip()] if neg and neg.strip() else []
