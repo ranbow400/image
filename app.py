@@ -66,8 +66,8 @@ def api_login():
 ON_SERVER = os.path.exists("/root/autodl-tmp/ComfyUI")
 SERVER_BASE = "/root/autodl-tmp/ComfyUI"
 SSH_KEY = os.path.expanduser(r"~/.ssh/id_ed25519")
-SSH_TARGET = "connect.westd.seetacloud.com"
-SSH_PORT = "16628"
+SSH_TARGET = "connect.westc.seetacloud.com"
+SSH_PORT = "52096"
 
 # ---------- 任务队列 ----------
 TASKS = {}  # id -> {status, payload, images, error, created}
@@ -128,7 +128,7 @@ def cors(resp):
     return resp
 
 
-SERVER_PUBLIC = "https://u1139344-ac6e-02e24c29.westd.seetacloud.com:8443"
+SERVER_PUBLIC = "https://u1139344-ba3f-327f7e53.westc.seetacloud.com:8443"
 
 
 @app.route("/api/favs", methods=["GET", "POST", "OPTIONS"])
