@@ -637,9 +637,10 @@ def build_workflow(p):
     hires = p.get("hires", False)
     hires_scale = float(p.get("hires_scale", 1.5))
     hires_denoise = float(p.get("hires_denoise", 0.4))
-    cn = p.get("controlnet")  # {enabled, image, model, strength} or None
+    cn = p.get("controlnet")  # {enabled, image, model, strength, start_percent, end_percent}
     src_image = p.get("src_image")
     denoise = float(p.get("denoise", 0.5))
+    ip = p.get("ipadapter") if isinstance(p.get("ipadapter"), dict) else None
 
     nodes = {
         "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
@@ -682,7 +683,8 @@ def build_workflow(p):
                              "inputs": {"positive": pos_ref, "negative": neg_ref,
                                         "control_net": ["cn_net", 0], "image": ["cn_img", 0],
                                         "strength": float(cn.get("strength", 0.8)),
-                                        "start_percent": 0.0, "end_percent": 1.0}}
+                                        "start_percent": float(cn.get("start_percent", 0.0)),
+                                        "end_percent": float(cn.get("end_percent", 1.0))}}
         pos_ref, neg_ref = ["cn_apply", 0], ["cn_apply", 1]
 
     nodes["3"] = {"class_type": "EmptyLatentImage",
@@ -733,6 +735,23 @@ def build_workflow(p):
         inpaint_active = False
     else:
         inpaint_active = False
+    # 一致性锁：IPAdapter（拿参考图锁身份/风格/构图，不占用 CFG）
+    if ip and ip.get("enabled") and ip.get("image"):
+        nodes["ip_ld"] = {"class_type": "IPAdapterUnifiedLoader",
+                          "inputs": {"model": cur_model,
+                                     "preset": ip.get("preset", "PLUS (high strength)")}}
+        nodes["ip_im"] = {"class_type": "LoadImage", "inputs": {"image": ip["image"]}}
+        nodes["ip_ap"] = {"class_type": "IPAdapterAdvanced",
+                          "inputs": {"model": ["ip_ld", 0], "ipadapter": ["ip_ld", 1],
+                                     "image": ["ip_im", 0],
+                                     "weight": float(ip.get("weight", 0.7)),
+                                     "weight_type": ip.get("weight_type", "linear"),
+                                     "combine_embeds": ip.get("combine_embeds", "concat"),
+                                     "start_at": float(ip.get("start_at", 0.0)),
+                                     "end_at": float(ip.get("end_at", 1.0)),
+                                     "embeds_scaling": ip.get("embeds_scaling", "V only")}}
+        cur_model = ["ip_ap", 0]
+
     nodes["10"] = {"class_type": "KSampler",
                    "inputs": {"model": cur_model, "positive": pos_ref, "negative": neg_ref,
                               "latent_image": latent_ref, "seed": seed, "steps": steps, "cfg": cfg,
@@ -768,6 +787,305 @@ def build_workflow(p):
         nodes["9"] = {"class_type": "SaveImage",
                       "inputs": {"images": ["8", 0], "filename_prefix": prefix}}
     return nodes
+
+
+# ---------- 动作序列 / 动图（骨架驱动的帧序列）----------
+POSE_CKPT = "xinsir-controlnet-openpose-sdxl-1.0.safetensors"
+POSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "poses")
+
+
+def _dw_workflow(image, scale_stick=True):
+    """DWPose 提取骨架。手/脸检测关掉（会去下别的模型），scale_stick 开=粗色块，
+    即 xinsir 版 openpose ControlNet 训练时吃的样式。"""
+    return {
+        "src": {"class_type": "LoadImage", "inputs": {"image": image}},
+        "dw": {"class_type": "DWPreprocessor",
+               "inputs": {"image": ["src", 0],
+                          "pose_estimator": "dw-ll_ucoco_384.onnx",
+                          "bbox_detector": "yolox_l.onnx",
+                          "detect_body": "enable", "detect_hand": "disable",
+                          "detect_face": "disable",
+                          "scale_stick_for_xinsr_cn": "enable" if scale_stick else "disable"}},
+        "9": {"class_type": "SaveImage", "inputs": {"images": ["dw", 0],
+              "filename_prefix": "pose"}},
+    }
+
+
+def _comfy_run(wf, timeout=600):
+    """提交 workflow 并等出结果，返回 (images, error)"""
+    resp = comfy_post("/prompt", {"prompt": wf})
+    pid = resp["prompt_id"]
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(1.5)
+        try:
+            h = comfy_get(f"/history/{pid}")
+        except Exception:
+            continue
+        if pid in h:
+            st = h[pid]
+            bad = [m for m in st.get("status", {}).get("messages", [])
+                   if m[0] in ("execution_error", "execution_interrupted")]
+            imgs = []
+            for out in st.get("outputs", {}).values():
+                for img in out.get("images", []):
+                    imgs.append({"filename": img["filename"],
+                                 "subfolder": img.get("subfolder", ""),
+                                 "type": img.get("type", "output")})
+            return imgs, (json.dumps(bad, ensure_ascii=False)[:400] if bad else None)
+    return [], "timeout"
+
+
+def _local_output_path(img):
+    return os.path.join(SERVER_BASE, "output", img.get("subfolder", ""), img["filename"])
+
+
+def _upload_bytes_to_input(data, name):
+    boundary = "----genui" + str(random.randint(10**9, 10**10))
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="image"; filename="{name}"\r\n'
+            f"Content-Type: image/png\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(COMFY + "/upload/image", body,
+                                 {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read()).get("name", name)
+
+
+def _copy_output_to_input(img, name):
+    """把 ComfyUI output 里的图放到 input，供后续 LoadImage 使用"""
+    if ON_SERVER:
+        import shutil
+        shutil.copy(_local_output_path(img), os.path.join(SERVER_BASE, "input", name))
+        return name
+    url = (f"{COMFY}/view?filename={img['filename']}"
+           f"&subfolder={img.get('subfolder', '')}&type={img.get('type', 'output')}")
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = r.read()
+    return _upload_bytes_to_input(data, name)
+
+
+@app.route("/api/pose_extract", methods=["POST"])
+def api_pose_extract():
+    """从一张图提取 openpose 骨架，结果落到 input/，可直接当控制图用"""
+    data = request.get_json(silent=True) or {}
+    src = data.get("src_image") or ""
+    if not src:
+        return jsonify({"ok": False, "error": "缺少 src_image"})
+    try:
+        imgs, err = _comfy_run(_dw_workflow(src, scale_stick=bool(data.get("scale_stick", True))),
+                              timeout=300)
+        if err or not imgs:
+            return jsonify({"ok": False, "error": err or "骨架提取没有输出"})
+        name = _copy_output_to_input(imgs[0], "pose_%d.png" % int(time.time()))
+        return jsonify({"ok": True, "name": name})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/pose_library")
+def api_pose_library():
+    """内置姿势库（static/poses/manifest.json）"""
+    items = []
+    mf = os.path.join(POSE_DIR, "manifest.json")
+    if os.path.exists(mf):
+        try:
+            with open(mf, encoding="utf-8") as f:
+                items = json.load(f)
+        except Exception:
+            items = []
+    return jsonify({"ok": True, "items": items})
+
+
+@app.route("/api/pose_use", methods=["POST"])
+def api_pose_use():
+    """把内置姿势复制进 ComfyUI input，返回可直接用的文件名"""
+    data = request.get_json(silent=True) or {}
+    fn = os.path.basename(data.get("file", ""))
+    src = os.path.join(POSE_DIR, fn)
+    if not fn or not os.path.exists(src):
+        return jsonify({"ok": False, "error": "姿势不存在"})
+    name = "lib_" + fn
+    try:
+        if ON_SERVER:
+            import shutil
+            shutil.copy(src, os.path.join(SERVER_BASE, "input", name))
+        else:
+            with open(src, "rb") as f:
+                _upload_bytes_to_input(f.read(), name)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, "name": name})
+
+
+@app.route("/api/frames", methods=["POST"])
+def api_frames():
+    """动作序列批量出图：每个骨架 × N 张候选，全部进同一个队列；
+    每条任务带 group 信息（第几帧/第几张候选），前端按帧分组挑图。"""
+    p = request.get_json(force=True)
+    skeletons = [s for s in (p.get("skeletons") or []) if s]
+    if not skeletons:
+        return jsonify({"ok": False, "error": "还没有骨架图"})
+    cand = max(1, min(6, int(p.get("candidates", 1) or 1)))
+    base_seed = int(p.get("seed", -1) or -1)
+    if base_seed < 0:
+        base_seed = random.randint(0, 2 ** 31)
+    gid = uuid.uuid4().hex[:10]
+    ids = []
+    for fi, sk in enumerate(skeletons):
+        for ci in range(cand):
+            q = {k: v for k, v in p.items() if k != "skeletons"}
+            q["mode"] = "gen"
+            q["prefix"] = "seq_%s_f%02d_c%d" % (gid, fi + 1, ci + 1)
+            # 同一帧的不同候选换种子（不然完全一样）；不同帧之间保持同一套种子，帧间更一致
+            q["seed"] = base_seed + ci
+            q["controlnet"] = {"enabled": True, "image": sk,
+                               "model": p.get("cn_model") or POSE_CKPT,
+                               "strength": float(p.get("cn_strength", 1.0)),
+                               "start_percent": float(p.get("cn_start", 0.0)),
+                               "end_percent": float(p.get("cn_end", 1.0))}
+            if p.get("base_image"):
+                q["src_image"] = p["base_image"]
+            tid = uuid.uuid4().hex[:12]
+            with TASK_LOCK:
+                TASKS[tid] = {"status": "queued", "payload": q, "images": [],
+                              "error": None, "created": time.time(),
+                              "progress": 0, "stage": "queued",
+                              "group": {"id": gid, "frame": fi + 1, "cand": ci + 1,
+                                        "total_frames": len(skeletons), "candidates": cand,
+                                        "skeleton": sk, "index": len(ids)}}
+            with COND:
+                TASK_ORDER.append(tid)
+                COND.notify_all()
+            ids.append(tid)
+    save_tasks()
+    return jsonify({"ok": True, "group": gid, "task_ids": ids, "seed": base_seed,
+                    "frames": len(skeletons), "candidates": cand})
+
+
+def _skeleton_parts(path):
+    """读骨架图 → {量化颜色: 归一化质心}，用来比对姿势"""
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    W, H = im.size
+    px = im.load()
+    acc = {}
+    for y in range(0, H, 2):
+        for x in range(0, W, 2):
+            r, g, b = px[x, y]
+            if r + g + b < 90:
+                continue
+            key = (r // 32 * 32, g // 32 * 32, b // 32 * 32)
+            a = acc.setdefault(key, [0.0, 0.0, 0])
+            a[0] += x
+            a[1] += y
+            a[2] += 1
+    out = {}
+    for k, (sx, sy, n) in acc.items():
+        if n >= 6:
+            out[k] = (sx / n / W, sy / n / H)
+    return out
+
+
+def _sharpness(path):
+    """拉普拉斯方差，粗略判清晰度"""
+    try:
+        import numpy as np
+        from PIL import Image
+        im = Image.open(path).convert("L").resize((256, 256))
+        a = np.asarray(im, dtype=np.float32)
+        lap = (-4 * a[1:-1, 1:-1] + a[:-2, 1:-1] + a[2:, 1:-1] + a[1:-1, :-2] + a[1:-1, 2:])
+        return float(lap.var())
+    except Exception:
+        return 0.0
+
+
+@app.route("/api/frame_score", methods=["POST"])
+def api_frame_score():
+    """堆量之后的自动挑帧：把每张候选重新提骨架，跟目标骨架比关键点质心，再叠清晰度。"""
+    data = request.get_json(force=True)
+    target_name = data.get("skeleton") or ""
+    images = data.get("images") or []
+    if not target_name or not images:
+        return jsonify({"ok": False, "error": "缺少骨架或候选图"})
+    try:
+        tpath = (os.path.join(SERVER_BASE, "input", target_name) if ON_SERVER
+                 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "input", target_name))
+        target = _skeleton_parts(tpath) if os.path.exists(tpath) else {}
+    except Exception:
+        target = {}
+    out = []
+    for it in images:
+        item = {"filename": it.get("filename"), "subfolder": it.get("subfolder", ""),
+                "type": it.get("type", "output")}
+        try:
+            # DWPreprocessor 只能读 input/，所以先把候选图复制过去
+            iname = _copy_output_to_input(item, "score_" + it["filename"])
+            imgs, err = _comfy_run(_dw_workflow(iname, scale_stick=False), timeout=180)
+            if err or not imgs:
+                item.update({"pose": 0.0, "sharp": 0.0, "score": 0.0, "error": err or "骨架提取失败"})
+                out.append(item)
+                continue
+            cpath = _local_output_path(imgs[0]) if ON_SERVER else None
+            if cpath and os.path.exists(cpath):
+                cand = _skeleton_parts(cpath)
+                sharp = _sharpness(cpath)
+            else:
+                cand, sharp = {}, 0.0
+            common = [k for k in target if k in cand]
+            if target and common:
+                d = sum((((target[k][0] - cand[k][0]) ** 2 + (target[k][1] - cand[k][1]) ** 2) ** 0.5)
+                        for k in common) / len(common)
+                pose = max(0.0, 1.0 - d / 0.25)
+            else:
+                pose = 0.0
+            item.update({"pose": round(pose, 3), "sharp": round(sharp, 1),
+                         "score": round(pose * 0.75 + min(1.0, sharp / 800.0) * 0.25, 3)})
+        except Exception as e:
+            item.update({"pose": 0.0, "sharp": 0.0, "score": 0.0, "error": str(e)[:200]})
+        out.append(item)
+    out.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return jsonify({"ok": True, "items": out})
+
+
+@app.route("/api/gif", methods=["POST"])
+def api_gif():
+    """把挑好的帧合成动图（PIL，服务器端没装 ffmpeg 也能用）"""
+    from PIL import Image
+    data = request.get_json(force=True)
+    images = data.get("images") or []
+    fps = float(data.get("fps", 4) or 4)
+    frames = []
+    for it in images:
+        try:
+            if ON_SERVER:
+                p = _local_output_path(it)
+                if os.path.exists(p):
+                    frames.append(Image.open(p).convert("RGB"))
+            else:
+                url = (f"{COMFY}/view?filename={it['filename']}"
+                       f"&subfolder={it.get('subfolder', '')}&type={it.get('type', 'output')}")
+                with urllib.request.urlopen(url, timeout=60) as r:
+                    frames.append(Image.open(BytesIO(r.read())).convert("RGB"))
+        except Exception as e:
+            print(f"[gif] 跳过一帧 {e}", flush=True)
+    if not frames:
+        return jsonify({"ok": False, "error": "没有可用帧"})
+    w, h = frames[0].size
+    frames = [f if f.size == (w, h) else f.resize((w, h)) for f in frames]
+    if ON_SERVER:
+        out_dir = os.path.join(SERVER_BASE, "output", "gifs")
+        os.makedirs(out_dir, exist_ok=True)
+        name = "seq_%s.gif" % uuid.uuid4().hex[:10]
+        out = os.path.join(out_dir, name)
+    else:
+        name = "seq_%s.gif" % uuid.uuid4().hex[:10]
+        out = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+    duration = max(40, int(1000.0 / fps))
+    frames[0].save(out, save_all=True, append_images=frames[1:], duration=duration,
+                   loop=0, optimize=True)
+    return jsonify({"ok": True, "filename": name, "subfolder": "gifs",
+                    "url": "/api/image?filename=%s&subfolder=gifs&type=output" % name,
+                    "frames": len(frames), "bytes": os.path.getsize(out)})
 
 
 @app.route("/api/generate", methods=["POST"])
@@ -850,6 +1168,7 @@ def api_tasks():
                   "error": t["error"], "created": t["created"],
                   "progress": t.get("progress", 0), "stage": t.get("stage", ""),
                   "eta": t.get("eta"),
+                  "group": t.get("group"),
                   "prompt": t["payload"].get("prompt", "")[:80],
                   "payload": t["payload"]}
                  for tid, t in TASKS.items()]

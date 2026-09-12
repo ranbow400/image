@@ -1,0 +1,34 @@
+[
+ {
+  "name": "站立",
+  "file": "pose_01.png"
+ },
+ {
+  "name": "抬手1",
+  "file": "pose_02.png"
+ },
+ {
+  "name": "抬手2",
+  "file": "pose_03.png"
+ },
+ {
+  "name": "举手",
+  "file": "pose_04.png"
+ },
+ {
+  "name": "双手举起",
+  "file": "pose_05.png"
+ },
+ {
+  "name": "双臂张开",
+  "file": "pose_06.png"
+ },
+ {
+  "name": "双手叉腰",
+  "file": "pose_07.png"
+ },
+ {
+  "name": "单臂前伸",
+  "file": "pose_08.png"
+ }
+]

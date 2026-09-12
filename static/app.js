@@ -120,6 +120,21 @@ function buildPayload() {
       auto_mask: MASK_MODE,  // 自动遮罩来源（body/all_but_face），后端跳过二次脸部保护防误检
     };
   }
+  if ($("cnOn").checked && CN_IMAGE) {
+    p.controlnet = {
+      enabled: true, image: CN_IMAGE,
+      model: $("cnModel").value || "xinsir-controlnet-openpose-sdxl-1.0.safetensors",
+      strength: parseFloat($("cnStrength").value) || 1.0,
+    };
+  }
+  if ($("idOn").checked && ID_IMAGE) {
+    p.ipadapter = {
+      enabled: true, image: ID_IMAGE,
+      weight: parseFloat($("idWeight").value),
+      weight_type: $("idType").value,
+      preset: $("idPreset").value,
+    };
+  }
   return p;
 }
 
@@ -469,7 +484,7 @@ document.querySelectorAll(".tab").forEach(t => {
     document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
     t.classList.add("active");
     const page = t.dataset.page;
-    document.querySelectorAll(".page-gen, .page-imgs").forEach(x => x.classList.remove("active"));
+    document.querySelectorAll(".page-gen, .page-imgs, .page-seq").forEach(x => x.classList.remove("active"));
     document.querySelector(`.page-${page}`).classList.add("active");
   };
 });
@@ -1320,3 +1335,339 @@ init();
 pollTasks();
 refreshTriggers();
 loadFavs();
+
+// ================= 骨架控制 / 一致性锁 / 动作序列（2026-09-13） =================
+let CN_IMAGE = "";
+let ID_IMAGE = "";
+
+const uploadToInput = async (file) => {
+  const fd = new FormData();
+  fd.append("file", file);
+  return api("/api/upload", { method: "POST", body: fd });
+};
+const inputUrl = (name) => `/api/image?filename=${encodeURIComponent(name)}&type=input`;
+
+function switchPage(page) {
+  const tab = document.querySelector(`.tab[data-page="${page}"]`);
+  if (tab) tab.click();
+}
+
+function bindCollapse(headId, bodyId, arrowId) {
+  const head = $(headId), body = $(bodyId), arrow = $(arrowId);
+  if (!head || !body) return;
+  const key = "genui_collapse_" + bodyId;
+  const apply = (open) => {
+    body.style.display = open ? "" : "none";
+    if (arrow) arrow.textContent = open ? "▾" : "▸";
+    localStorage.setItem(key, open ? "1" : "0");
+  };
+  head.onclick = () => apply(body.style.display === "none");
+  const saved = localStorage.getItem(key);
+  apply(saved === null ? true : saved === "1");
+}
+
+function setPreview(imgEl, nameEl, name) {
+  if (!name) { imgEl.style.display = "none"; imgEl.removeAttribute("src"); nameEl.textContent = ""; return; }
+  imgEl.src = inputUrl(name);
+  imgEl.style.display = "block";
+  nameEl.textContent = name;
+}
+
+async function loadCnModels() {
+  try {
+    const r = await api("/api/controlnets");
+    const sel = $("cnModel");
+    if (!sel) return;
+    const items = (r.items || []).filter(n => n && !n.startsWith("put_"));
+    sel.innerHTML = items.map(n => `<option>${n}</option>`).join("");
+    const pref = items.find(n => /openpose/i.test(n));
+    if (pref) sel.value = pref;
+  } catch (e) {}
+}
+
+// --- ControlNet 卡片 ---
+$("cnFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("cnName").textContent = "上传中...";
+  const r = await uploadToInput(f);
+  if (!r.ok) { $("cnName").textContent = "上传失败: " + r.error; return; }
+  CN_IMAGE = r.name;
+  setPreview($("cnPreview"), $("cnName"), CN_IMAGE);
+  $("cnOn").checked = true;
+});
+$("cnExtract").onclick = async () => {
+  if (!REF_IMAGE) { $("cnName").textContent = "先到 img2img 里上传参考图"; return; }
+  $("cnName").textContent = "提取骨架中...";
+  const r = await api("/api/pose_extract", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ src_image: REF_IMAGE }),
+  });
+  if (!r.ok) { $("cnName").textContent = "提取失败: " + r.error; return; }
+  CN_IMAGE = r.name;
+  setPreview($("cnPreview"), $("cnName"), CN_IMAGE);
+  $("cnOn").checked = true;
+};
+$("cnClear").onclick = () => { CN_IMAGE = ""; setPreview($("cnPreview"), $("cnName"), ""); };
+$("cnUseLib").onclick = () => {
+  switchPage("seq");
+  const c = $("seqLibCard");
+  c.style.display = "block";
+  loadPoseLib();
+  setTimeout(() => c.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+};
+
+// --- 一致性锁（IPAdapter）---
+$("idFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("idName").textContent = "上传中...";
+  const r = await uploadToInput(f);
+  if (!r.ok) { $("idName").textContent = "上传失败: " + r.error; return; }
+  ID_IMAGE = r.name;
+  setPreview($("idPreview"), $("idName"), ID_IMAGE);
+  $("idOn").checked = true;
+});
+$("idUseRef").onclick = () => {
+  if (!REF_IMAGE) { $("idName").textContent = "img2img 里还没有参考图"; return; }
+  ID_IMAGE = REF_IMAGE;
+  setPreview($("idPreview"), $("idName"), ID_IMAGE);
+  $("idOn").checked = true;
+};
+
+bindCollapse("cnToggle", "cnBody", "cnArrow");
+bindCollapse("idToggle", "idBody", "idArrow");
+loadCnModels();
+
+// --- 动作序列 ---
+let SEQ_SKELETONS = [];
+let SEQ_GROUP = null;
+let SEQ_PICKED = {};
+let SEQ_SCORES = {};
+let seqTimer = null;
+
+function renderSeqList() {
+  const box = $("seqList");
+  if (!SEQ_SKELETONS.length) {
+    box.innerHTML = '<div class="seq-empty">还没有骨架图：上传 / 从参考图提取 / 从姿势库选</div>';
+    return;
+  }
+  box.innerHTML = "";
+  SEQ_SKELETONS.forEach((s, i) => {
+    const d = document.createElement("div");
+    d.className = "seq-item";
+    d.innerHTML = `<img src="${inputUrl(s.name)}" alt=""><div class="seq-idx">${i + 1}</div><button class="seq-del" title="移除">✕</button>`;
+    d.querySelector(".seq-del").onclick = (ev) => {
+      ev.stopPropagation();
+      SEQ_SKELETONS.splice(i, 1);
+      renderSeqList();
+    };
+    box.appendChild(d);
+  });
+}
+
+async function seqAddFiles(files) {
+  for (const f of files) {
+    $("seqStatus").textContent = "上传 " + f.name + " ...";
+    const r = await uploadToInput(f);
+    if (r.ok) SEQ_SKELETONS.push({ name: r.name });
+    else $("seqStatus").textContent = "上传失败: " + r.error;
+  }
+  renderSeqList();
+  $("seqStatus").textContent = SEQ_SKELETONS.length + " 张骨架就绪";
+}
+
+$("seqUploadBtn").onclick = () => $("seqFile").click();
+$("seqFile").addEventListener("change", (e) => seqAddFiles([...e.target.files]));
+$("seqExtractBtn").onclick = async () => {
+  if (!REF_IMAGE) { $("seqStatus").textContent = "先到「生成」页传 img2img 参考图"; return; }
+  $("seqStatus").textContent = "提取骨架中...";
+  const r = await api("/api/pose_extract", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ src_image: REF_IMAGE }),
+  });
+  if (!r.ok) { $("seqStatus").textContent = "提取失败: " + r.error; return; }
+  SEQ_SKELETONS.push({ name: r.name });
+  renderSeqList();
+  $("seqStatus").textContent = "已加入提取的骨架";
+};
+$("seqClear").onclick = () => {
+  SEQ_SKELETONS = []; SEQ_PICKED = {}; SEQ_SCORES = {}; SEQ_GROUP = null;
+  renderSeqList();
+  $("seqFrames").innerHTML = "";
+  $("seqGifBox").innerHTML = "";
+  $("seqStatus").textContent = "";
+};
+
+async function loadPoseLib() {
+  const r = await api("/api/pose_library");
+  const box = $("seqLibList");
+  box.innerHTML = "";
+  const items = r.items || [];
+  if (!items.length) { box.innerHTML = '<div class="seq-empty">姿势库为空</div>'; return; }
+  items.forEach(it => {
+    const d = document.createElement("div");
+    d.className = "seq-item lib";
+    d.title = it.name || it.file;
+    d.innerHTML = `<img src="/static/poses/${it.file}" alt="">`;
+    d.onclick = async () => {
+      const r2 = await api("/api/pose_use", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file: it.file }),
+      });
+      if (r2.ok) {
+        SEQ_SKELETONS.push({ name: r2.name });
+        renderSeqList();
+        $("seqStatus").textContent = "已加入：" + (it.name || it.file);
+      } else {
+        $("seqStatus").textContent = "加入失败: " + r2.error;
+      }
+    };
+    box.appendChild(d);
+  });
+}
+$("seqLibBtn").onclick = () => {
+  const c = $("seqLibCard");
+  c.style.display = "block";
+  loadPoseLib();
+  c.scrollIntoView({ behavior: "smooth", block: "start" });
+};
+
+$("seqGenBtn").onclick = async () => {
+  if (!SEQ_SKELETONS.length) { $("seqStatus").textContent = "先加骨架图"; return; }
+  const p = buildPayload();
+  const payload = {
+    checkpoint: p.checkpoint, loras: p.loras, vae: p.vae,
+    prompt: p.prompt, negative: p.negative,
+    steps: p.steps, cfg: p.cfg, sampler: p.sampler, scheduler: p.scheduler,
+    width: p.width, height: p.height, clip_skip: p.clip_skip,
+    skeletons: SEQ_SKELETONS.map(s => s.name),
+    candidates: parseInt($("seqCand").value) || 1,
+    cn_strength: parseFloat($("seqCn").value),
+    denoise: parseFloat($("seqDenoise").value),
+    seed: parseInt($("seed").value),
+    base_image: ($("seqUseBase").checked && $("i2iOn").checked && REF_IMAGE) ? REF_IMAGE : "",
+    ipadapter: p.ipadapter || null,
+  };
+  $("seqStatus").textContent = "入队中...";
+  const r = await api("/api/frames", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) { $("seqStatus").textContent = "失败: " + r.error; return; }
+  SEQ_GROUP = r.group; SEQ_PICKED = {}; SEQ_SCORES = {};
+  $("seqStatus").textContent = `已入队 ${r.task_ids.length} 张（${r.frames} 帧 × ${r.candidates} 候选，seed ${r.seed}）`;
+  startSeqPoll();
+};
+
+function startSeqPoll() {
+  if (seqTimer) clearInterval(seqTimer);
+  seqTimer = setInterval(pollSeq, 3000);
+  pollSeq();
+}
+
+async function pollSeq() {
+  if (!SEQ_GROUP) { if (seqTimer) { clearInterval(seqTimer); seqTimer = null; } return; }
+  const r = await api("/api/tasks");
+  if (!r.ok) return;
+  const mine = (r.tasks || []).filter(t => t.group && t.group.id === SEQ_GROUP);
+  if (!mine.length) return;
+  const done = mine.filter(t => t.status === "done").length;
+  const running = mine.filter(t => t.status === "running" || t.status === "queued").length;
+  renderSeqFrames(mine);
+  if (running) {
+    $("seqStatus").textContent = `序列进行中：完成 ${done}/${mine.length}`;
+  } else {
+    $("seqStatus").textContent = `序列完成：${done}/${mine.length} 张，挑帧或直接合成动图`;
+    if (seqTimer) { clearInterval(seqTimer); seqTimer = null; }
+  }
+}
+
+function renderSeqFrames(tasks) {
+  const byFrame = {};
+  for (const t of tasks) {
+    const f = t.group.frame;
+    (byFrame[f] = byFrame[f] || []).push(t);
+  }
+  const box = $("seqFrames");
+  box.innerHTML = "";
+  const frames = Object.keys(byFrame).map(Number).sort((a, b) => a - b);
+  for (const f of frames) {
+    const cands = byFrame[f].sort((a, b) => a.group.cand - b.group.cand);
+    // 没手动挑过就默认用第一张出图的候选
+    if (!SEQ_PICKED[f]) {
+      const first = cands.find(c => c.images && c.images.length);
+      if (first) SEQ_PICKED[f] = first.images[0];
+    }
+    const wrap = document.createElement("div");
+    wrap.className = "seq-frame";
+    const head = document.createElement("div");
+    head.className = "seq-frame-head";
+    const pickedFn = SEQ_PICKED[f] && SEQ_PICKED[f].filename;
+    head.innerHTML = `<span>第 ${f} 帧</span><span>${cands.filter(c => c.status === "done").length}/${cands.length} 完成</span>`;
+    wrap.appendChild(head);
+    const row = document.createElement("div");
+    row.className = "seq-cands";
+    for (const c of cands) {
+      if (!c.images || !c.images.length) {
+        const ph = document.createElement("div");
+        ph.className = "seq-cand";
+        ph.innerHTML = `<div style="height:128px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#888">${c.status === "running" ? "生成中" : c.status}</div>`;
+        row.appendChild(ph);
+        continue;
+      }
+      const img = c.images[0];
+      const d = document.createElement("div");
+      d.className = "seq-cand" + (pickedFn === img.filename ? " best" : "");
+      const sc = SEQ_SCORES[img.filename];
+      d.innerHTML = `<img src="${imgUrl(img, true)}" alt="">${sc !== undefined ? `<div class="sc">${sc}</div>` : ""}`;
+      d.onclick = () => { SEQ_PICKED[f] = img; renderSeqFrames(tasks); };
+      row.appendChild(d);
+    }
+    wrap.appendChild(row);
+    box.appendChild(wrap);
+  }
+}
+
+$("seqPickBest").onclick = async () => {
+  if (!SEQ_GROUP) { $("seqStatus").textContent = "先生成序列"; return; }
+  const r = await api("/api/tasks");
+  const mine = (r.tasks || []).filter(t => t.group && t.group.id === SEQ_GROUP && t.status === "done" && t.images && t.images.length);
+  const byFrame = {};
+  for (const t of mine) (byFrame[t.group.frame] = byFrame[t.group.frame] || []).push(t);
+  const frs = Object.keys(byFrame).map(Number).sort((a, b) => a - b);
+  if (!frs.length) { $("seqStatus").textContent = "还没有出图"; return; }
+  for (let i = 0; i < frs.length; i++) {
+    const f = frs[i];
+    const cands = byFrame[f];
+    const sk = cands[0].group.skeleton;
+    $("seqStatus").textContent = `自动挑帧 ${i + 1}/${frs.length}（第 ${f} 帧）...`;
+    const rr = await api("/api/frame_score", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skeleton: sk, images: cands.map(c => c.images[0]) }),
+    });
+    if (!rr.ok) continue;
+    for (const it of rr.items) SEQ_SCORES[it.filename] = it.score;
+    if (rr.items[0]) SEQ_PICKED[f] = rr.items[0];
+  }
+  const r2 = await api("/api/tasks");
+  renderSeqFrames((r2.tasks || []).filter(t => t.group && t.group.id === SEQ_GROUP));
+  $("seqStatus").textContent = "自动挑帧完成（绿框 = 选中的帧）";
+};
+
+$("seqGifBtn").onclick = async () => {
+  const frames = Object.keys(SEQ_PICKED).map(Number).sort((a, b) => a - b).map(f => SEQ_PICKED[f]);
+  if (!frames.length) { $("seqStatus").textContent = "还没有可用的帧"; return; }
+  $("seqStatus").textContent = "合成动图中...";
+  const r = await api("/api/gif", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ images: frames, fps: parseInt($("seqFps").value) || 4 }),
+  });
+  if (!r.ok) { $("seqStatus").textContent = "合成失败: " + r.error; return; }
+  $("seqGifBox").innerHTML =
+    `<img src="${r.url}&t=${Date.now()}" alt="">
+     <a href="${r.url}" download="${r.filename}" style="display:block;margin-top:6px">下载 ${r.filename} · ${r.frames} 帧 · ${(r.bytes / 1024).toFixed(0)} KB</a>`;
+  $("seqStatus").textContent = "动图已生成";
+};
+
+renderSeqList();

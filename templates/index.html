@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>生成工作台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260829b">
+<link rel="stylesheet" href="/static/style.css?v=20260913a">
 </head>
 <body>
 <div class="app">
@@ -21,6 +21,7 @@
   <main class="layout">
     <div class="tabbar" id="tabbar">
       <button class="tab active" data-page="gen">⚙ 生成</button>
+      <button class="tab" data-page="seq">🎞 序列</button>
       <button class="tab" data-page="imgs">🖼 图片</button>
     </div>
 
@@ -94,6 +95,64 @@
       </section>
 
       <section class="card">
+        <h3 id="cnToggle" style="cursor:pointer;user-select:none" title="点击收起/展开">ControlNet 姿势控制 <span id="cnArrow" style="font-size:11px;color:#888"></span></h3>
+        <div id="cnBody">
+          <label class="checkline">
+            <input type="checkbox" id="cnOn">
+            <span>启用（用骨架图锁姿势）</span>
+          </label>
+          <input type="file" id="cnFile" accept="image/*">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <img id="cnPreview" style="max-height:78px;display:none;border-radius:8px;background:#000" alt="">
+            <span id="cnName" style="font-size:12px;color:#888"></span>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button type="button" class="chip" id="cnExtract">🦴 从参考图提取骨架</button>
+            <button type="button" class="chip" id="cnUseLib">📚 选内置姿势</button>
+            <button type="button" class="chip" id="cnClear">清空</button>
+          </div>
+          <label>控制强度 <input id="cnStrength" type="number" value="1" step="0.05" min="0" max="2"></label>
+          <label>控制网模型 <select id="cnModel"></select></label>
+          <p class="hint">骨架图就是 openpose 控制图。没有骨架图时，点「从参考图提取骨架」把任意人物图转成骨架；内置姿势可以直接选。</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3 id="idToggle" style="cursor:pointer;user-select:none" title="点击收起/展开">一致性锁（IPAdapter） <span id="idArrow" style="font-size:11px;color:#888"></span></h3>
+        <div id="idBody">
+          <label class="checkline">
+            <input type="checkbox" id="idOn">
+            <span>锁定参考图的身份 / 风格</span>
+          </label>
+          <input type="file" id="idFile" accept="image/*">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <img id="idPreview" style="max-height:78px;display:none;border-radius:8px" alt="">
+            <span id="idName" style="font-size:12px;color:#888"></span>
+          </div>
+          <button type="button" class="chip" id="idUseRef">用 img2img 参考图当锁</button>
+          <div class="grid2">
+            <label>权重 <input id="idWeight" type="number" value="0.7" step="0.05" min="0" max="2"></label>
+            <label>模式
+              <select id="idType">
+                <option value="linear">linear（均衡）</option>
+                <option value="style transfer">style transfer（风格）</option>
+                <option value="composition">composition（构图）</option>
+                <option value="strong style transfer">strong style</option>
+              </select>
+            </label>
+          </div>
+          <label>预设
+            <select id="idPreset">
+              <option>PLUS (high strength)</option>
+              <option>STANDARD (medium strength)</option>
+              <option>PLUS FACE (portraits)</option>
+            </select>
+          </label>
+          <p class="hint">拿一张参考图锁住长相/画风，做动作序列时特别有用：姿势变、脸不变。</p>
+        </div>
+      </section>
+
+      <section class="card">
         <h3>参数</h3>
         <div class="grid2">
           <label>Steps <input id="steps" type="number" value="28" min="1" max="150"></label>
@@ -139,6 +198,52 @@
       </details>
     </aside>
 
+    <aside class="panel page-seq">
+      <section class="card">
+        <h3>动作序列（骨架 → 动图）</h3>
+        <p class="hint">把动作拆成一串骨架图，逐帧生成、挑帧、合成动图。骨架可以上传、可以从参考图提取，也可以直接用内置姿势库。</p>
+        <div class="seq-actions">
+          <button type="button" class="chip" id="seqUploadBtn">＋ 上传骨架</button>
+          <button type="button" class="chip" id="seqExtractBtn">🦴 从参考图提取</button>
+          <button type="button" class="chip" id="seqLibBtn">📚 姿势库</button>
+          <button type="button" class="chip" id="seqClear">清空</button>
+        </div>
+        <input type="file" id="seqFile" accept="image/*" multiple style="display:none">
+        <div id="seqList" class="seq-list"></div>
+        <div class="grid2" style="margin-top:4px">
+          <label>每帧候选数 <input id="seqCand" type="number" value="2" min="1" max="6"></label>
+          <label>骨架强度 <input id="seqCn" type="number" value="1.1" step="0.05" min="0" max="2"></label>
+          <label>重绘幅度 <input id="seqDenoise" type="number" value="0.55" step="0.05" min="0.1" max="1"></label>
+          <label>帧率 <input id="seqFps" type="number" value="4" min="1" max="24"></label>
+        </div>
+        <label class="checkline">
+          <input type="checkbox" id="seqUseBase" checked>
+          <span>用 img2img 参考图当底（保角色/背景）</span>
+        </label>
+        <label class="checkline">
+          <input type="checkbox" id="seqAutoPick" checked>
+          <span>自动挑帧（重提骨架比对 + 清晰度）</span>
+        </label>
+        <button class="btn-primary" id="seqGenBtn">生成序列</button>
+        <div class="status" id="seqStatus"></div>
+      </section>
+
+      <section class="card">
+        <h3>帧与挑帧</h3>
+        <div id="seqFrames" class="seq-frames"></div>
+        <div class="seq-actions" style="margin-top:8px">
+          <button type="button" class="chip" id="seqGifBtn">🎞 合成动图</button>
+          <button type="button" class="chip" id="seqPickBest">✨ 自动挑帧</button>
+        </div>
+        <div id="seqGifBox" class="seq-gifbox"></div>
+      </section>
+
+      <section class="card" id="seqLibCard" style="display:none">
+        <h3>内置姿势库</h3>
+        <div id="seqLibList" class="seq-list"></div>
+      </section>
+    </aside>
+
     <section class="results page-imgs">
       <div id="taskList" class="tasklist"></div>
       <div id="gallery" class="gallery"></div>
@@ -169,6 +274,6 @@
   <div id="favList" class="fav-list"></div>
 </div>
 
-<script src="/static/app.js?v=20260830b"></script>
+<script src="/static/app.js?v=20260913a"></script>
 </body>
 </html>
