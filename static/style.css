@@ -409,6 +409,8 @@ input[type=file] { padding: 6px; font-size: 12px; }
 }
 .seq-item.lib { cursor: pointer; }
 .seq-empty { font-size: 12px; color: var(--muted); padding: 28px 6px; }
+/* 骨架图是黑底细线，缩略图里几乎是全黑 → 反转显示（保持色相的深色模式转白底） */
+.pose-img { background: #f2f2f6; filter: invert(1) hue-rotate(180deg); }
 .seq-frames { display: flex; flex-direction: column; gap: 12px; }
 .seq-frame { border: 1px solid var(--border); border-radius: 12px; padding: 8px; }
 .seq-frame-head {

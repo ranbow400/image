@@ -794,15 +794,18 @@ POSE_CKPT = "xinsir-controlnet-openpose-sdxl-1.0.safetensors"
 POSE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "poses")
 
 
-def _dw_workflow(image, scale_stick=True):
+def _dw_workflow(image, scale_stick=True, resolution=1024, bbox="yolox_l.onnx"):
     """DWPose 提取骨架。手/脸检测关掉（会去下别的模型），scale_stick 开=粗色块，
-    即 xinsir 版 openpose ControlNet 训练时吃的样式。"""
+    即 xinsir 版 openpose ControlNet 训练时吃的样式。
+    resolution 默认给大一点：远景/大图上物体小时，检测尺度太低会直接认不出人。
+    bbox="None" = 跳过人体检测，整张图当单人估姿（夸张画风里 yolox 常常检不到人）。"""
     return {
         "src": {"class_type": "LoadImage", "inputs": {"image": image}},
         "dw": {"class_type": "DWPreprocessor",
                "inputs": {"image": ["src", 0],
                           "pose_estimator": "dw-ll_ucoco_384.onnx",
-                          "bbox_detector": "yolox_l.onnx",
+                          "bbox_detector": bbox,
+                          "resolution": int(resolution),
                           "detect_body": "enable", "detect_hand": "disable",
                           "detect_face": "disable",
                           "scale_stick_for_xinsr_cn": "enable" if scale_stick else "disable"}},
@@ -811,9 +814,38 @@ def _dw_workflow(image, scale_stick=True):
     }
 
 
+def _nonblack_ratio(path, step=4):
+    """骨架图里非黑像素占比：太小说明没检出人体"""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("RGB")
+        px = im.load()
+        W, H = im.size
+        tot = hit = 0
+        for y in range(0, H, step):
+            for x in range(0, W, step):
+                tot += 1
+                r, g, b = px[x, y]
+                if r + g + b > 40:
+                    hit += 1
+        return hit / max(1, tot)
+    except Exception:
+        return -1.0
+
+
 def _comfy_run(wf, timeout=600):
-    """提交 workflow 并等出结果，返回 (images, error)"""
-    resp = comfy_post("/prompt", {"prompt": wf})
+    """提交 workflow 并等出结果，返回 (images, error)；HTTP 错误带上 ComfyUI 的原话"""
+    import urllib.error
+    try:
+        resp = comfy_post("/prompt", {"prompt": wf})
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        return [], "comfy 拒绝(%s): %s" % (e.code, body[:400])
+    except Exception as e:
+        return [], str(e)
     pid = resp["prompt_id"]
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -872,12 +904,35 @@ def api_pose_extract():
     if not src:
         return jsonify({"ok": False, "error": "缺少 src_image"})
     try:
-        imgs, err = _comfy_run(_dw_workflow(src, scale_stick=bool(data.get("scale_stick", True))),
-                              timeout=300)
-        if err or not imgs:
-            return jsonify({"ok": False, "error": err or "骨架提取没有输出"})
-        name = _copy_output_to_input(imgs[0], "pose_%d.png" % int(time.time()))
-        return jsonify({"ok": True, "name": name})
+        res = int(data.get("resolution", 1024) or 1024)
+        stick = bool(data.get("scale_stick", True))
+        forced = data.get("bbox") or ""
+        # yolox 在夸张/极端画风的动漫人身上常常检不到人，依次退到 yolo_nas、再退到整图估姿
+        order = [forced] if forced else ["yolox_l.onnx", "yolo_nas_s_fp16.onnx", "None"]
+        best, last_err = None, None
+        for bbox in order:
+            imgs, err = _comfy_run(_dw_workflow(src, scale_stick=stick, resolution=res, bbox=bbox),
+                                   timeout=300)
+            if err or not imgs:
+                last_err = err
+                continue
+            name = _copy_output_to_input(imgs[0], "pose_%s.png" % uuid.uuid4().hex[:8])
+            dst = (os.path.join(SERVER_BASE, "input", name) if ON_SERVER else None)
+            ratio = _nonblack_ratio(dst) if dst and os.path.exists(dst) else -1.0
+            # bbox=None 是蒙的，要求骨架占画面比例更高才认
+            need = 0.02 if bbox == "None" else 0.01
+            if best is None or ratio > best[1]:
+                best = (name, ratio, bbox)
+            if ratio >= need:
+                break
+        if best is None:
+            return jsonify({"ok": False, "error": last_err or "骨架提取没有输出"})
+        name, ratio, bbox = best
+        need = 0.02 if bbox == "None" else 0.01
+        empty = (ratio < need)
+        return jsonify({"ok": True, "name": name, "nonblack": round(ratio, 4),
+                        "bbox": bbox, "empty": empty,
+                        "hint": "没检测到人体：这张图画风/构图不太好认，换一张人物完整、占比更大的图，或直接用内置姿势" if empty else ""})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 

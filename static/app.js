@@ -1338,6 +1338,7 @@ loadFavs();
 
 // ================= 骨架控制 / 一致性锁 / 动作序列（2026-09-13） =================
 let CN_IMAGE = "";
+let CN_SRC = "";
 let ID_IMAGE = "";
 
 const uploadToInput = async (file) => {
@@ -1396,14 +1397,27 @@ $("cnFile").addEventListener("change", async (e) => {
   setPreview($("cnPreview"), $("cnName"), CN_IMAGE);
   $("cnOn").checked = true;
 });
+$("cnSrcFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("cnSrcName").textContent = "上传中...";
+  const r = await uploadToInput(f);
+  if (!r.ok) { $("cnSrcName").textContent = "上传失败: " + r.error; return; }
+  CN_SRC = r.name;
+  const img = $("cnSrcPreview");
+  img.src = inputUrl(CN_SRC);
+  img.style.display = "block";
+  $("cnSrcName").textContent = CN_SRC;
+});
 $("cnExtract").onclick = async () => {
-  if (!REF_IMAGE) { $("cnName").textContent = "先到 img2img 里上传参考图"; return; }
+  if (!CN_SRC) { $("cnName").textContent = "先在下面传一张姿势来源图"; return; }
   $("cnName").textContent = "提取骨架中...";
   const r = await api("/api/pose_extract", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ src_image: REF_IMAGE }),
+    body: JSON.stringify({ src_image: CN_SRC }),
   });
   if (!r.ok) { $("cnName").textContent = "提取失败: " + r.error; return; }
+  if (r.empty) { $("cnName").textContent = r.hint || "没检测到人体"; return; }
   CN_IMAGE = r.name;
   setPreview($("cnPreview"), $("cnName"), CN_IMAGE);
   $("cnOn").checked = true;
@@ -1428,12 +1442,6 @@ $("idFile").addEventListener("change", async (e) => {
   setPreview($("idPreview"), $("idName"), ID_IMAGE);
   $("idOn").checked = true;
 });
-$("idUseRef").onclick = () => {
-  if (!REF_IMAGE) { $("idName").textContent = "img2img 里还没有参考图"; return; }
-  ID_IMAGE = REF_IMAGE;
-  setPreview($("idPreview"), $("idName"), ID_IMAGE);
-  $("idOn").checked = true;
-};
 
 bindCollapse("cnToggle", "cnBody", "cnArrow");
 bindCollapse("idToggle", "idBody", "idArrow");
@@ -1456,7 +1464,7 @@ function renderSeqList() {
   SEQ_SKELETONS.forEach((s, i) => {
     const d = document.createElement("div");
     d.className = "seq-item";
-    d.innerHTML = `<img src="${inputUrl(s.name)}" alt=""><div class="seq-idx">${i + 1}</div><button class="seq-del" title="移除">✕</button>`;
+    d.innerHTML = `<img class="pose-img" src="${inputUrl(s.name)}" alt=""><div class="seq-idx">${i + 1}</div><button class="seq-del" title="移除">✕</button>`;
     d.querySelector(".seq-del").onclick = (ev) => {
       ev.stopPropagation();
       SEQ_SKELETONS.splice(i, 1);
@@ -1479,18 +1487,25 @@ async function seqAddFiles(files) {
 
 $("seqUploadBtn").onclick = () => $("seqFile").click();
 $("seqFile").addEventListener("change", (e) => seqAddFiles([...e.target.files]));
-$("seqExtractBtn").onclick = async () => {
-  if (!REF_IMAGE) { $("seqStatus").textContent = "先到「生成」页传 img2img 参考图"; return; }
+$("seqExtractBtn").onclick = () => $("seqSrcFile").click();
+$("seqSrcFile").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $("seqStatus").textContent = "上传来源图...";
+  const up = await uploadToInput(f);
+  if (!up.ok) { $("seqStatus").textContent = "上传失败: " + up.error; return; }
   $("seqStatus").textContent = "提取骨架中...";
   const r = await api("/api/pose_extract", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ src_image: REF_IMAGE }),
+    body: JSON.stringify({ src_image: up.name }),
   });
   if (!r.ok) { $("seqStatus").textContent = "提取失败: " + r.error; return; }
+  if (r.empty) { $("seqStatus").textContent = r.hint || "没检测到人体"; return; }
   SEQ_SKELETONS.push({ name: r.name });
   renderSeqList();
   $("seqStatus").textContent = "已加入提取的骨架";
-};
+  e.target.value = "";
+});
 $("seqClear").onclick = () => {
   SEQ_SKELETONS = []; SEQ_PICKED = {}; SEQ_SCORES = {}; SEQ_GROUP = null;
   renderSeqList();
@@ -1509,7 +1524,7 @@ async function loadPoseLib() {
     const d = document.createElement("div");
     d.className = "seq-item lib";
     d.title = it.name || it.file;
-    d.innerHTML = `<img src="/static/poses/${it.file}" alt="">`;
+    d.innerHTML = `<img class="pose-img" src="/static/poses/${it.file}" alt="">`;
     d.onclick = async () => {
       const r2 = await api("/api/pose_use", {
         method: "POST", headers: { "Content-Type": "application/json" },

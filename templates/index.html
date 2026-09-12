@@ -1,10 +1,10 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>生成工作台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260913a">
+<link rel="stylesheet" href="/static/style.css?v=20260913b">
 </head>
 <body>
 <div class="app">
@@ -101,19 +101,28 @@
             <input type="checkbox" id="cnOn">
             <span>启用（用骨架图锁姿势）</span>
           </label>
-          <input type="file" id="cnFile" accept="image/*">
+          <label>控制图 / 骨架图
+            <input type="file" id="cnFile" accept="image/*">
+          </label>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <img id="cnPreview" style="max-height:78px;display:none;border-radius:8px;background:#000" alt="">
+            <img id="cnPreview" class="pose-img" style="max-height:96px;display:none;border-radius:8px" alt="">
             <span id="cnName" style="font-size:12px;color:#888"></span>
           </div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap">
-            <button type="button" class="chip" id="cnExtract">🦴 从参考图提取骨架</button>
+          <label>姿势来源图（人物图，提取骨架用）
+            <input type="file" id="cnSrcFile" accept="image/*">
+          </label>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <img id="cnSrcPreview" style="max-height:64px;display:none;border-radius:8px" alt="">
+            <span id="cnSrcName" style="font-size:12px;color:#888"></span>
+          </div>
+          <div class="seq-actions">
+            <button type="button" class="chip" id="cnExtract">🦴 从来源图提取骨架</button>
             <button type="button" class="chip" id="cnUseLib">📚 选内置姿势</button>
             <button type="button" class="chip" id="cnClear">清空</button>
           </div>
           <label>控制强度 <input id="cnStrength" type="number" value="1" step="0.05" min="0" max="2"></label>
           <label>控制网模型 <select id="cnModel"></select></label>
-          <p class="hint">骨架图就是 openpose 控制图。没有骨架图时，点「从参考图提取骨架」把任意人物图转成骨架；内置姿势可以直接选。</p>
+          <p class="hint">控制图就是给 ControlNet 的图（openpose 骨架）。想从人物图生成骨架，就传一张到「姿势来源图」再点提取；内置姿势也可以直接选。</p>
         </div>
       </section>
 
@@ -129,7 +138,7 @@
             <img id="idPreview" style="max-height:78px;display:none;border-radius:8px" alt="">
             <span id="idName" style="font-size:12px;color:#888"></span>
           </div>
-          <button type="button" class="chip" id="idUseRef">用 img2img 参考图当锁</button>
+          <button type="button" class="chip" id="idUseRef" style="display:none">用参考图当锁</button>
           <div class="grid2">
             <label>权重 <input id="idWeight" type="number" value="0.7" step="0.05" min="0" max="2"></label>
             <label>模式
@@ -204,11 +213,12 @@
         <p class="hint">把动作拆成一串骨架图，逐帧生成、挑帧、合成动图。骨架可以上传、可以从参考图提取，也可以直接用内置姿势库。</p>
         <div class="seq-actions">
           <button type="button" class="chip" id="seqUploadBtn">＋ 上传骨架</button>
-          <button type="button" class="chip" id="seqExtractBtn">🦴 从参考图提取</button>
+          <button type="button" class="chip" id="seqExtractBtn">🦴 从图片提取骨架</button>
           <button type="button" class="chip" id="seqLibBtn">📚 姿势库</button>
           <button type="button" class="chip" id="seqClear">清空</button>
         </div>
         <input type="file" id="seqFile" accept="image/*" multiple style="display:none">
+        <input type="file" id="seqSrcFile" accept="image/*" style="display:none">
         <div id="seqList" class="seq-list"></div>
         <div class="grid2" style="margin-top:4px">
           <label>每帧候选数 <input id="seqCand" type="number" value="2" min="1" max="6"></label>
@@ -274,6 +284,6 @@
   <div id="favList" class="fav-list"></div>
 </div>
 
-<script src="/static/app.js?v=20260913a"></script>
+<script src="/static/app.js?v=20260913b"></script>
 </body>
 </html>
