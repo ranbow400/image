@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>生成工作台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260916a">
+<link rel="stylesheet" href="/static/style.css?v=20260920g">
 </head>
 <body>
 <div class="app">
@@ -14,6 +14,7 @@
       <button class="btn-ghost" id="luxBtn">✨ 豪横预设</button>
       <button class="btn-ghost" id="importBtn">📥 导入模型</button>
       <button class="btn-ghost" id="favBtn">⭐ 收藏 (<span id="favCount">0</span>)</button>
+      <button class="btn-ghost" id="rateBtn">📊 评分 (<span id="rateCount">0</span>)</button>
       <div class="conn" id="conn">连接中...</div>
     </div>
   </header>
@@ -30,7 +31,10 @@
         <label>Checkpoint <select id="ckpt"></select></label>
         <label>LoRA</label>
         <div id="loraList"></div>
-        <button class="btn-ghost" id="addLora">+ 添加 LoRA</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn-ghost" id="addLora">+ 添加 LoRA</button>
+          <button class="btn-ghost" id="galleryBtn">🖼 画廊选 LoRA</button>
+        </div>
         <label>VAE <select id="vae"></select></label>
         <label>CLIP Skip
           <input id="clipSkip" type="number" min="1" max="4" value="1">
@@ -135,6 +139,19 @@
           <button class="chip" data-w="1024" data-h="1536">2:3 大</button>
           <button class="chip" data-w="1216" data-h="832">3:2</button>
         </div>
+        <div class="taste-box">
+          <label>噪声叠加（打分学出的潜空间偏向，不动参数不动词）
+            <select id="biasMode">
+              <option value="diff">好图 − 坏图 对比方向</option>
+              <option value="good">高分图平均方向</option>
+            </select>
+          </label>
+          <label class="bias-slider">强度 <span id="biasVal">0.70</span>
+            <input type="range" id="biasStrength" min="0" max="2" step="0.05" value="0.7">
+          </label>
+          <p class="hint" id="biasHint">0 = 关；1 = 相当于把高分图平均 latent 加一遍</p>
+          <button type="button" class="btn-ghost" id="biasRebuild">用最新打分重建偏向（约 3 分钟）</button>
+        </div>
       </section>
 
       <button class="btn-primary" id="genBtn">生成</button>
@@ -153,6 +170,20 @@
       <div id="gallery" class="gallery"></div>
     </section>
   </main>
+</div>
+
+<!-- LoRA 画廊（点缩略图选模型） -->
+<div class="cgal hidden" id="coverGallery">
+  <div class="cgal-box">
+    <div class="cgal-head">
+      <span>🖼 LoRA 画廊</span>
+      <input id="cgalSearch" placeholder="搜索名称 / 触发词">
+      <button class="lb-close" id="cgalClose" style="position:static">✕</button>
+    </div>
+    <div class="cgal-tabs" id="cgalTabs"></div>
+    <div class="cgal-grid" id="cgalGrid"></div>
+    <div class="cgal-foot" id="cgalFoot"></div>
+  </div>
 </div>
 
 <!-- 大图查看 + 信息面板 -->
@@ -178,6 +209,19 @@
   <div id="favList" class="fav-list"></div>
 </div>
 
-<script src="/static/app.js?v=20260916a"></script>
+<!-- 评分统计面板 -->
+<div class="favpanel hidden" id="ratePanel">
+  <div class="fav-head">
+    <span>📊 评分统计（1-5 星）</span>
+    <button class="lb-close" id="rateClose" style="position:static">✕</button>
+  </div>
+  <div class="rate-body" id="rateBody"></div>
+  <div class="rate-foot">
+    <a class="btn-ghost" id="rateExport" href="/api/ratings/export" download="ratings.txt">下载清单</a>
+    <button class="btn-ghost" id="rateCopy">复制清单</button>
+  </div>
+</div>
+
+<script src="/static/app.js?v=20260920g"></script>
 </body>
 </html>

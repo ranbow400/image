@@ -3,7 +3,8 @@ const LS_KEY = "***";
 const LS_FAV = "genui_favs_v1";
 
 const CONTROLS = ["ckpt", "vae", "prompt", "negative", "steps", "cfg", "sampler", "scheduler",
-                  "width", "height", "seed", "batch", "clipSkip", "enhCompat"];
+                  "width", "height", "seed", "batch", "clipSkip", "enhCompat",
+                  "biasMode", "biasStrength"];
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -103,8 +104,62 @@ function collectSettings() {
     clip_skip: parseInt($("clipSkip").value) || 1,
     src_image: ($("i2iOn").checked && REF_IMAGE) ? REF_IMAGE : "",
     denoise: parseFloat($("denoise").value),
+    noise_bias: { mode: $("biasMode").value, strength: parseFloat($("biasStrength").value) || 0 },
   };
 }
+
+// ---------- 噪声叠加：打分学出的潜空间偏向（不动参数、不动提示词） ----------
+const RATE_LABEL = { 5: "收藏", 4: "优秀", 3: "正常", 2: "有问题", 1: "用不了" };
+let biasTimer = null;
+
+function paintBiasVal() {
+  const v = parseFloat($("biasStrength").value) || 0;
+  $("biasVal").textContent = v.toFixed(2);
+  return v;
+}
+
+function paintBiasInfo(r) {
+  const el = $("biasHint");
+  if (!el || !r || !r.ok) return;
+  const m = r.meta || {}, f = r.files || {}, p = r.progress || {};
+  const ready = f.good && f.diff;
+  if (r.running) {
+    const total = p.total || 0, done = p.done || 0;
+    el.textContent = total
+      ? `重建中：已编码 ${done}/${total} 张（好图 ${p.n_good || "?"} / 坏图 ${p.n_bad || "?"}，有缓存的图直接跳过）`
+      : "重建中：正在读取打分数据...";
+    return;
+  }
+  const head = ready
+    ? `偏向已就绪 · 好图 ${m.n_good} 张 / 坏图 ${m.n_bad} 张（3★ 正常的不参与） · 建于 ${m.built_at || "?"}`
+    : "偏向文件还没建，点下面的按钮生成";
+  const last = p.built_at && p.built_at !== m.built_at ? ` · 上次重建 ${p.built_at}` : "";
+  el.textContent = head + last;
+}
+
+async function loadBiasInfo() {
+  paintBiasVal();
+  try {
+    const r = await api("/api/noise_bias");
+    paintBiasInfo(r);
+    if (r.running && !biasTimer) {
+      biasTimer = setInterval(async () => {
+        const rr = await api("/api/noise_bias");
+        paintBiasInfo(rr);
+        if (!rr.running) { clearInterval(biasTimer); biasTimer = null; loadBiasInfo(); }
+      }, 4000);
+    }
+  } catch (e) {}
+}
+
+$("biasStrength").oninput = () => { paintBiasVal(); saveSettings(); };
+$("biasMode").onchange = () => { saveSettings(); };
+$("biasRebuild").onclick = async () => {
+  if (!confirm("用当前打分重建偏向？有缓存的图直接复用，只编码新增的图。")) return;
+  const r = await api("/api/noise_bias/rebuild", { method: "POST" });
+  $("biasHint").textContent = r.ok ? r.msg : ("重建失败: " + (r.error || ""));
+  if (r.ok) loadBiasInfo();
+};
 
 function buildPayload() {
   const p = collectSettings();
@@ -318,6 +373,9 @@ async function init() {
       addLoraRow();
     }
     refreshTriggers();
+    loadCovers().then(() => { refreshLoraThumbs(); rebuildLoraSelects(); renderCgalTabs(); });
+    loadRatings();
+    loadBiasInfo();
   } catch (e) {
     $("conn").textContent = "连接失败";
     $("conn").classList.add("bad");
@@ -329,19 +387,335 @@ function addLoraRow(name = "", weight = 0.8) {
   const box = $("loraList");
   const row = document.createElement("div");
   row.className = "lora-row";
+  const thumb = document.createElement("img");
+  thumb.className = "lora-thumb"; thumb.alt = ""; thumb.title = "点开画廊选 LoRA";
+  thumb.style.display = "none";
   const sel = document.createElement("select");
-  sel.innerHTML = (window.LORAS || []).map(n => `<option ${n === name ? "selected" : ""}>${n}</option>`).join("");
+  sel.innerHTML = loraOptionsHtml(name);
   const w = document.createElement("input");
   w.type = "number"; w.step = "0.05"; w.min = "0"; w.max = "2"; w.value = weight;
+  const gal = document.createElement("button");
+  gal.className = "gal"; gal.textContent = "🖼"; gal.title = "画廊选 LoRA";
+  gal.onclick = () => openCoverGallery(sel);
   const del = document.createElement("button");
   del.className = "del"; del.textContent = "✕";
   del.onclick = () => { row.remove(); saveSettings(); };
-  sel.onchange = saveSettings; w.oninput = saveSettings;
-  row.append(sel, w, del);
+  sel.onchange = () => { updateRowThumb(thumb, sel.value); saveSettings(); };
+  w.oninput = saveSettings;
+  thumb.onclick = () => openCoverGallery(sel);
+  row.append(thumb, sel, w, gal, del);
   box.appendChild(row);
+  updateRowThumb(thumb, sel.value);
 }
 
 $("addLora").onclick = () => { addLoraRow(); saveSettings(); };
+
+// ---------- 图片评分（1-5 星；打分时把提示词与生成参数一起快照到服务器，图片被刷掉也不丢） ----------
+let RATINGS = {};        // {文件名: {score, prompt, negative, seq, task, ts, settings}}
+let RATING_COUNTS = {};  // {"1":n ... "5":n}
+
+async function loadRatings() {
+  try {
+    const r = await api("/api/ratings");
+    if (r && r.ok) {
+      RATINGS = r.items || {};
+      renderRatingSummary(r.counts, r.total);
+      syncStars();
+    }
+  } catch (e) {}
+}
+
+function scoreOf(name) { return (RATINGS[name] && RATINGS[name].score) || 0; }
+
+async function setScore(name, score, settings, taskId) {
+  if (!name) { $("status").textContent = "拿不到文件名，先打开大图再打分"; return; }
+  const st = settings || (RATINGS[name] && RATINGS[name].settings) || {};
+  try {
+    const r = await api("/api/rate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        filename: name, score,
+        prompt: st.prompt || "", negative: st.negative || "",
+        settings: st, task: taskId || "",
+      }),
+    });
+    if (!r.ok) { $("status").textContent = "打分失败: " + (r.error || ""); return; }
+    RATINGS = r.items || RATINGS;
+    renderRatingSummary(r.counts, r.total);
+    syncStars();
+    $("status").textContent = score ? `已打 ${score} 分（提示词与参数已存）` : "已取消评分";
+  } catch (e) {
+    $("status").textContent = "打分失败";
+  }
+}
+
+function starRow(name, settings, big) {
+  const box = document.createElement("div");
+  box.className = "stars" + (big ? " stars-big" : "");
+  box.dataset.fn = name || "";
+  for (let i = 1; i <= 5; i++) {
+    const b = document.createElement("button");
+    b.className = "star"; b.type = "button"; b.dataset.v = i; b.textContent = "★";
+    b.title = `${i} 分（再点同分 = 取消）`;
+    b.onclick = (e) => {
+      e.stopPropagation();
+      setScore(name, scoreOf(name) === i ? 0 : i, settings);
+    };
+    box.appendChild(b);
+  }
+  paintStars(box, scoreOf(name));
+  return box;
+}
+
+function paintStars(box, score) {
+  box.querySelectorAll(".star").forEach((b, idx) => b.classList.toggle("on", idx < score));
+  box.dataset.score = score || 0;
+}
+
+function syncStars() {
+  document.querySelectorAll(".stars[data-fn]").forEach(b => paintStars(b, scoreOf(b.dataset.fn)));
+}
+
+function lbFilename(it) {
+  if (it && it.filename) return it.filename;
+  const m = /[?&]filename=([^&]+)/.exec((it && it.url) || "");
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
+function ratingText() {
+  const lines = ["# 图片评分清单（1-5 星）：分 \t 序号 \t 文件 \t 提示词",
+                 "# 合计: " + Object.keys(RATINGS).length + " 张", ""];
+  for (let s = 5; s >= 1; s--) {
+    const rows = Object.keys(RATINGS).filter(n => RATINGS[n].score === s)
+      .sort((a, b) => (RATINGS[a].seq || 0) - (RATINGS[b].seq || 0));
+    lines.push(`## ${s} 星（${rows.length} 张）`);
+    rows.forEach(n => lines.push(`${s}\t${RATINGS[n].seq != null ? RATINGS[n].seq : ""}\t${n}\t${RATINGS[n].prompt || ""}`));
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function renderRatingSummary(counts, total) {
+  if (counts) RATING_COUNTS = counts;
+  const n = total != null ? total : Object.keys(RATINGS).length;
+  const badge = $("rateCount");
+  if (badge) badge.textContent = n;
+  const body = $("rateBody");
+  if (!body) return;
+  body.innerHTML = "";
+  const legend = document.createElement("div");
+  legend.className = "rate-legend";
+  legend.textContent = "口径：5 收藏 / 4 优秀 / 3 正常 / 2 有显著问题 / 1 完全用不了（噪声偏向只用 4-5 和 1-2，3 不参与）";
+  body.appendChild(legend);
+  if (!n) {
+    const p = document.createElement("div");
+    p.className = "rate-empty";
+    p.textContent = "还没有评分。图片卡片下面点星星，或打开大图后按键盘 1-5 快速打分（打完自动下一张）。\n口径：5 收藏 / 4 优秀 / 3 正常 / 2 有显著问题 / 1 完全用不了。提示词和生成参数会一起存到服务器，图片被刷掉也不会丢。";
+    body.appendChild(p);
+    return;
+  }
+  for (let s = 5; s >= 1; s--) {
+    const rows = Object.keys(RATINGS).filter(x => RATINGS[x].score === s)
+      .sort((a, b) => (RATINGS[a].seq || 0) - (RATINGS[b].seq || 0));
+    const sec = document.createElement("div");
+    sec.className = "rate-sec";
+    const h = document.createElement("div");
+    h.className = "rate-sec-h";
+    h.textContent = `${s} 星 · ${RATE_LABEL[s] || ""} `;
+    const sp = document.createElement("span");
+    sp.textContent = `${rows.length} 张`;
+    h.appendChild(sp);
+    sec.appendChild(h);
+    if (rows.length) {
+      const box = document.createElement("div");
+      box.className = "rate-names";
+      box.textContent = rows.map(nm => {
+        const v = RATINGS[nm];
+        const seq = v.seq != null ? `#${v.seq} ` : "";
+        return `${RATE_LABEL[v.score] || v.score}★ ${seq}${nm}\n    ${(v.prompt || "（无提示词快照）").slice(0, 160)}`;
+      }).join("\n");
+      sec.appendChild(box);
+    }
+    body.appendChild(sec);
+  }
+}
+
+$("rateBtn").onclick = async () => {
+  const p = $("ratePanel");
+  const show = p.classList.contains("hidden");
+  p.classList.toggle("hidden", !show);
+  $("favPanel").classList.add("hidden");
+  if (show) { await loadRatings(); renderRatingSummary(RATING_COUNTS, Object.keys(RATINGS).length); }
+};
+$("rateClose").onclick = () => $("ratePanel").classList.add("hidden");
+$("rateCopy").onclick = async () => {
+  const txt = ratingText();
+  try {
+    await navigator.clipboard.writeText(txt);
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  $("status").textContent = "评分清单已复制";
+};
+
+// ---------- LoRA 画廊 ----------
+let COVERS = null;      // {lora文件名: {cover, trigger, kind}}，null = 尚未加载
+let cgalTarget = null;  // 画廊要写回的那一行 <select>
+let cgalKind = "";      // 画廊分类筛选（"" = 全部）
+const KIND_LABEL = { character: "角色", style: "画风", content: "内容", other: "其他" };
+const KIND_ORDER = ["character", "style", "content", "other"];
+
+function kindOf(name) {
+  const c = COVERS && COVERS[name];
+  return (c && c.kind) || "other";
+}
+
+// LoRA 下拉框：有类别数据时按 角色/画风/内容/其他 分组（optgroup）
+function loraOptionsHtml(selected) {
+  const names = window.LORAS || [];
+  const grouped = COVERS && names.some(n => COVERS[n] && COVERS[n].kind);
+  const one = n => `<option ${n === selected ? "selected" : ""}>${n}</option>`;
+  if (!grouped) return names.map(one).join("");
+  const groups = {};
+  names.forEach(n => { const k = kindOf(n); (groups[k] = groups[k] || []).push(n); });
+  return KIND_ORDER.filter(k => groups[k]).map(k =>
+    `<optgroup label="${KIND_LABEL[k] || k} (${groups[k].length})">` +
+    groups[k].map(one).join("") + "</optgroup>").join("");
+}
+
+function rebuildLoraSelects() {
+  document.querySelectorAll(".lora-row").forEach(r => {
+    const sel = r.querySelector("select");
+    if (!sel) return;
+    const cur = sel.value;
+    sel.innerHTML = loraOptionsHtml(cur);
+    if (cur) sel.value = cur;
+  });
+}
+
+function renderCgalTabs() {
+  const box = $("cgalTabs");
+  if (!box) return;
+  const names = window.LORAS || [];
+  const counts = {};
+  names.forEach(n => { const k = kindOf(n); counts[k] = (counts[k] || 0) + 1; });
+  const items = [["", "全部", names.length]]
+    .concat(KIND_ORDER.filter(k => counts[k]).map(k => [k, KIND_LABEL[k] || k, counts[k]]));
+  box.innerHTML = "";
+  items.forEach(([k, label, n]) => {
+    const b = document.createElement("button");
+    b.className = "cgal-tab" + (k === cgalKind ? " on" : "");
+    b.textContent = `${label} ${n}`;
+    b.onclick = () => {
+      cgalKind = k;
+      renderCgalTabs();
+      renderCoverGallery($("cgalSearch").value, cgalTarget ? cgalTarget.value : "");
+    };
+    box.appendChild(b);
+  });
+}
+
+async function loadCovers() {
+  if (COVERS) return COVERS;
+  try {
+    const r = await api("/api/covers");
+    COVERS = (r && r.items) || {};
+    if (r && r.generated_at) COVERS.generated_at = r.generated_at;
+  } catch (e) {
+    COVERS = {};
+  }
+  return COVERS;
+}
+
+function coverOf(name) {
+  const c = COVERS && COVERS[name];
+  return c && c.cover ? "/covers/" + encodeURIComponent(c.cover) : "";
+}
+
+function updateRowThumb(img, name) {
+  const url = coverOf(name);
+  if (url) { img.src = url; img.style.display = ""; }
+  else { img.removeAttribute("src"); img.style.display = "none"; }
+}
+
+function refreshLoraThumbs() {
+  document.querySelectorAll(".lora-row").forEach(r => {
+    const img = r.querySelector(".lora-thumb"), sel = r.querySelector("select");
+    if (img && sel) updateRowThumb(img, sel.value);
+  });
+}
+
+async function openCoverGallery(sel) {
+  cgalTarget = sel || document.querySelector(".lora-row select");
+  await loadCovers();
+  renderCgalTabs();
+  renderCoverGallery("", cgalTarget ? cgalTarget.value : "");
+  $("coverGallery").classList.remove("hidden");
+  setTimeout(() => $("cgalSearch").focus(), 30);
+}
+
+function closeCoverGallery() {
+  $("coverGallery").classList.add("hidden");
+  cgalTarget = null;
+}
+
+function renderCoverGallery(q, cur) {
+  const grid = $("cgalGrid");
+  if (!grid) return;
+  const names = window.LORAS || [];
+  const query = (q || "").trim().toLowerCase();
+  const shown = names.filter(n => {
+    if (cgalKind && kindOf(n) !== cgalKind) return false;
+    if (!query) return true;
+    const t = (COVERS && COVERS[n] && COVERS[n].trigger) || "";
+    return n.toLowerCase().includes(query) || t.toLowerCase().includes(query);
+  });
+  grid.innerHTML = "";
+  shown.forEach(n => {
+    const c = (COVERS && COVERS[n]) || {};
+    const url = coverOf(n);
+    const card = document.createElement("div");
+    card.className = "cgal-card" + (n === cur ? " sel" : "");
+    card.appendChild(url
+      ? Object.assign(document.createElement("img"),
+          { className: "c-thumb", src: url, loading: "lazy", alt: "" })
+      : Object.assign(document.createElement("div"),
+          { className: "c-noimg", textContent: c.error ? "生成失败" : "无封面" }));
+    const meta = document.createElement("div");
+    meta.className = "c-meta";
+    const nm = document.createElement("div");
+    nm.className = "c-name"; nm.textContent = n.replace(/\.safetensors$/, ""); nm.title = n;
+    const tg = document.createElement("div");
+    tg.className = "c-trig";
+    tg.textContent = c.trigger ? "触发词 " + c.trigger : "";
+    const bd = document.createElement("span");
+    bd.className = "c-kind k-" + kindOf(n);
+    bd.textContent = KIND_LABEL[kindOf(n)] || "其他";
+    nm.appendChild(bd);
+    meta.append(nm, tg);
+    card.appendChild(meta);
+    card.onclick = () => {
+      if (cgalTarget) { cgalTarget.value = n; refreshLoraThumbs(); renderTriggers(); saveSettings(); }
+      closeCoverGallery();
+    };
+    grid.appendChild(card);
+  });
+  const foot = $("cgalFoot");
+  if (foot) {
+    const withCover = names.filter(n => coverOf(n)).length;
+    foot.textContent = `共 ${names.length} 个 LoRA，${withCover} 个有封面 · 显示 ${shown.length} 个`
+      + (COVERS && COVERS.generated_at ? ` · 封面生成于 ${COVERS.generated_at}` : "");
+  }
+}
+
+$("cgalClose").onclick = closeCoverGallery;
+$("coverGallery").onclick = (e) => { if (e.target.id === "coverGallery") closeCoverGallery(); };
+$("cgalSearch").oninput = (e) => renderCoverGallery(e.target.value, cgalTarget ? cgalTarget.value : "");
+$("galleryBtn").onclick = () => openCoverGallery(document.querySelector(".lora-row select"));
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("coverGallery").classList.contains("hidden")) closeCoverGallery();
+});
 
 document.querySelectorAll(".chip").forEach(ch => {
   ch.onclick = () => { $("width").value = ch.dataset.w; $("height").value = ch.dataset.h; saveSettings(); };
@@ -479,7 +853,8 @@ async function submitGen() {
     body: JSON.stringify(payload),
   });
   if (!resp.ok) { $("status").textContent = "错误: " + resp.error; return; }
-  $("status").textContent = "任务 " + resp.task_id + " 已入队";
+  $("status").textContent = "任务 " + resp.task_id + " 已入队" +
+    ((resp.bias_notes || []).length ? " · " + resp.bias_notes.join("; ") : "");
   // 移动端自动切到图片页看进度
   if (getComputedStyle($("tabbar")).display !== "none") {
     document.querySelector(".tab[data-page=imgs]").click();
@@ -861,7 +1236,10 @@ function createDoneCard(t) {
     dl.download = "";
     dl.textContent = "下载";
     bar.append(fav, up, del, dl);
-    card.append(im, bar);
+    const rateRow = document.createElement("div");
+    rateRow.className = "rate-row";
+    rateRow.appendChild(starRow(it.filename, t.payload || {}, false));
+    card.append(im, bar, rateRow);
     cards.push(card);
   }
   return { kind: "done", cards, items };
@@ -962,6 +1340,13 @@ function showLbItem() {
   const h = document.createElement("h4");
   h.textContent = it.name || (LB_ITEMS.length > 1 ? `${LB_INDEX + 1}/${LB_ITEMS.length}` : "图片");
   side.appendChild(h);
+  const rateBox = document.createElement("div");
+  rateBox.className = "lb-rate";
+  const rateLab = document.createElement("div");
+  rateLab.className = "lb-rate-label";
+  rateLab.textContent = "评分（也可直接按 1-5 键，打完自动下一张；提示词与参数会一并存下）";
+  rateBox.append(rateLab, starRow(lbFilename(it), it.settings || {}, true));
+  side.appendChild(rateBox);
   if (it.settings) {
     const pre = document.createElement("pre");
     pre.className = "lb-settings";
@@ -1115,10 +1500,15 @@ window.addEventListener("mousemove", (e) => {
 });
 window.addEventListener("mouseup", () => lbDrag = null);
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { $("lightbox").classList.add("hidden"); $("favPanel").classList.add("hidden"); }
+  if (e.key === "Escape") { $("lightbox").classList.add("hidden"); $("favPanel").classList.add("hidden"); $("ratePanel").classList.add("hidden"); }
   if (!$("lightbox").classList.contains("hidden")) {
     if (e.key === "ArrowRight") lbMove(1);
     if (e.key === "ArrowLeft") lbMove(-1);
+    if (/^[1-5]$/.test(e.key)) {
+      const it = LB_ITEMS[LB_INDEX];
+      setScore(lbFilename(it), parseInt(e.key, 10), (it && it.settings) || {});
+      if (LB_ITEMS.length > 1) lbMove(1);
+    }
   }
 });
 // 触摸滑动切换（手机）

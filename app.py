@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 import urllib.request
+from collections import Counter
 from io import BytesIO
 
 from flask import Flask, jsonify, render_template, request, send_file
@@ -81,6 +82,21 @@ FAVS_FILE = "/root/autodl-tmp/favs.json" if ON_SERVER else os.path.join(
 # 任务记录持久化：重启/部署不丢历史任务
 TASKS_FILE = "/root/autodl-tmp/tasks.json" if ON_SERVER else os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tasks.json")
+# LoRA 画廊封面：放 genui 目录外，重新部署不影响；由 make_lora_covers.py 生成
+COVERS_DIR = "/root/autodl-tmp/genui_covers" if ON_SERVER else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "covers")
+# LoRA 类别（character/style/content/other）：{文件名: 类别}，画廊分组用；缺失一律按 other
+KINDS_FILE = "/root/autodl-tmp/lora_kinds.json" if ON_SERVER else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "lora_kinds.json")
+
+
+def _load_kinds():
+    try:
+        with open(KINDS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return {k: v for k, v in d.items() if isinstance(v, str) and not k.startswith("_")}
+    except Exception:
+        return {}
 
 
 def save_tasks():
@@ -470,6 +486,30 @@ def api_loras():
     return jsonify({"ok": True, "items": _obj_names("LoraLoader", "lora_name")})
 
 
+@app.route("/api/covers")
+def api_covers():
+    """LoRA 画廊封面索引（make_lora_covers.py 产出）：items[文件名] = {cover, trigger, kind}"""
+    try:
+        with open(os.path.join(COVERS_DIR, "index.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "items": {}})
+    kinds = _load_kinds()
+    for name, item in (data.get("items") or {}).items():
+        if isinstance(item, dict):
+            item["kind"] = kinds.get(name, "other")
+    data["kinds"] = kinds
+    return jsonify({"ok": True, **data})
+
+
+@app.route("/covers/<path:name>")
+def covers_file(name):
+    path = os.path.join(COVERS_DIR, secure_filename(name))
+    if not os.path.isfile(path):
+        return jsonify({"ok": False, "error": "not found"}), 404
+    return send_file(path)
+
+
 @app.route("/api/vaes")
 def api_vaes():
     items = _obj_names("VAELoader", "vae_name")
@@ -561,6 +601,27 @@ def build_workflow(p):
         nodes["enc"] = {"class_type": "VAEEncode",
                          "inputs": {"pixels": ["src", 0], "vae": vae_ref}}
         latent_ref, ks_denoise = ["enc", 0], denoise
+    # 噪声叠加：把打分学出的潜空间偏向加在初始 latent 上（KSampler 会再叠新鲜噪声）
+    b = bias_params(p)
+    if b and not b.get("error"):
+        nodes["nb_ld"] = {"class_type": "LoadLatent", "inputs": {"latent": b["file"]}}
+        nodes["nb_sc"] = {"class_type": "LatentUpscale",
+                          "inputs": {"samples": ["nb_ld", 0], "upscale_method": "bilinear",
+                                     "width": width, "height": height, "crop": "disabled"}}
+        nodes["nb_mul"] = {"class_type": "LatentMultiply",
+                           "inputs": {"samples": ["nb_sc", 0], "multiplier": b["mult"]}}
+        nb_ref = ["nb_mul", 0]
+        if batch > 1:
+            nodes["nb_rep"] = {"class_type": "RepeatLatentBatch",
+                               "inputs": {"samples": nb_ref, "amount": batch}}
+            nb_ref = ["nb_rep", 0]
+        if src_image:
+            # img2img 时把偏向叠到编码 latent 上（LatentAdd 形状一致）
+            nodes["nb_add"] = {"class_type": "LatentAdd",
+                               "inputs": {"samples1": latent_ref, "samples2": nb_ref}}
+            latent_ref = ["nb_add", 0]
+        else:
+            latent_ref = nb_ref
     # 一致性锁：IPAdapter（拿参考图锁身份/风格/构图，不占用 CFG）
     if ip and ip.get("enabled") and ip.get("image"):
         nodes["ip_ld"] = {"class_type": "IPAdapterUnifiedLoader",
@@ -606,12 +667,111 @@ def build_workflow(p):
     return nodes
 
 
+# ---------- 噪声叠加：用打分学出的潜空间偏向，生成时叠加到初始噪声上 ----------
+# 不动提示词、不动 CFG/步数等现有参数；只在 KSampler 的起点 latent 上加一个方向。
+BIAS_META = "/root/autodl-tmp/taste_bias_meta.json" if ON_SERVER else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "taste_bias_meta.json")
+COMFY_INPUT = "/root/autodl-tmp/ComfyUI/input" if ON_SERVER else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "input")
+TASTE_BIAS_SCRIPT = "/root/autodl-tmp/build_taste_bias.py"
+
+
+def bias_meta():
+    try:
+        with open(BIAS_META, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def bias_params(p):
+    """把页面上的"噪声叠加"参数换算成实际的 latent 缩放系数。"""
+    nb = p.get("noise_bias") if isinstance(p.get("noise_bias"), dict) else None
+    if not nb:
+        return None
+    try:
+        strength = float(nb.get("strength") or 0)
+    except Exception:
+        strength = 0.0
+    if strength <= 0:
+        return None
+    mode = nb.get("mode") if nb.get("mode") in ("good", "diff") else "diff"
+    fname = "taste_bias_%s.latent" % mode
+    if not os.path.exists(os.path.join(COMFY_INPUT, fname)):
+        return {"error": "偏向文件不存在，先在页面上点重建"}
+    meta = bias_meta()
+    raw = (meta.get("raw_rms") or {}).get("mean_good" if mode == "good" else "diff") or 1.0
+    sigma = float(meta.get("sigma_max") or 14.6146)
+    # 文件里的方向是单位 RMS；乘以 raw/sigma 后，strength=1 相当于"把高分图平均 latent 原样加一遍"
+    mult = round(strength * float(raw) / sigma, 5)
+    return {"mode": mode, "strength": strength, "mult": mult, "file": fname,
+            "n_good": meta.get("n_good"), "n_bad": meta.get("n_bad"),
+            "built_at": meta.get("built_at")}
+
+
+def bias_note(p):
+    b = bias_params(p)
+    if not b:
+        return []
+    if b.get("error"):
+        return ["噪声叠加: " + b["error"]]
+    return ["噪声叠加 %s 强度%.2f（系数 %.4f）" % (b["mode"], b["strength"], b["mult"])]
+
+
+@app.route("/api/noise_bias")
+def api_noise_bias():
+    meta = bias_meta()
+    files = {k: os.path.exists(os.path.join(COMFY_INPUT, "taste_bias_%s.latent" % k))
+             for k in ("good", "diff")}
+    prog = {}
+    try:
+        with open("/root/autodl-tmp/taste_build_progress.json", encoding="utf-8") as f:
+            prog = json.load(f)
+    except Exception:
+        prog = {}
+    lock = "/root/autodl-tmp/taste_build.lock"
+    running = False
+    if os.path.exists(lock):
+        try:
+            running = (time.time() - os.path.getmtime(lock)) < 3600
+        except Exception:
+            running = False
+    return jsonify({"ok": True, "meta": meta, "files": files,
+                    "progress": prog, "running": running})
+
+
+@app.route("/api/noise_bias/rebuild", methods=["POST"])
+def api_noise_bias_rebuild():
+    """按最新打分重建偏向（后台跑；有缓存的图不重编，只编新增的）"""
+    lock = "/root/autodl-tmp/taste_build.lock"
+    if os.path.exists(lock):
+        try:
+            age = time.time() - os.path.getmtime(lock)
+        except Exception:
+            age = 0
+        if age < 3600:
+            return jsonify({"ok": True, "running": True,
+                            "msg": "已经在重建中（%.0f 秒前开始），等它跑完" % age})
+        try:
+            os.remove(lock)
+        except Exception:
+            pass
+    try:
+        log = open("/root/autodl-tmp/taste_build.log", "ab")
+        subprocess.Popen(["/root/miniconda3/bin/python", "-u", TASTE_BIAS_SCRIPT],
+                         stdout=log, stderr=log, cwd="/root/autodl-tmp",
+                         start_new_session=True)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+    return jsonify({"ok": True, "running": True,
+                    "msg": "已开始重建：有缓存的图直接复用，只编码新增/变化的图"})
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
-    """入队生成，立即返回 task_id"""
+    """入队生成，立即返回 task_id；带 noise_bias 时会在 KSampler 起点叠上偏向"""
     p = request.get_json(force=True)
+    notes = bias_note(p)
     tid = uuid.uuid4().hex[:12]
-    p = {**p, "prefix": f"gen_{tid}"}
+    p = {**p, "prefix": f"gen_{tid}", "bias_notes": notes}
     with TASK_LOCK:
         TASKS[tid] = {"status": "queued", "payload": p, "images": [],
                       "error": None, "created": time.time(),
@@ -620,7 +780,7 @@ def api_generate():
         TASK_ORDER.append(tid)
         COND.notify_all()
     save_tasks()
-    return jsonify({"ok": True, "task_id": tid})
+    return jsonify({"ok": True, "task_id": tid, "bias_notes": notes})
 
 
 @app.route("/api/upscale", methods=["POST"])
@@ -949,6 +1109,159 @@ def api_import():
             pass
     return jsonify({"ok": True, "name": fname, "size_mb": round(total / 1e6, 1),
                     "dest": dest_dir})
+
+
+# 图片评分：{文件名: {score, prompt, negative, seq, task, ts, settings}}，放 genui 目录外，重新部署不丢；
+# 打分时把提示词与生成参数一并快照进去：图片文件被删、任务历史被刷掉都不影响评分记录。
+RATINGS_FILE = "/root/autodl-tmp/ratings.json" if ON_SERVER else os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ratings.json")
+# 快照保留的生成参数（白名单，避免把参考图 base64 存进来）
+RATING_SETTING_KEYS = ("prompt", "negative", "checkpoint", "vae", "loras", "steps", "cfg",
+                       "sampler", "scheduler", "seed", "width", "height", "batch",
+                       "clip_skip", "denoise", "hires", "hires_scale", "hires_denoise",
+                       "id_preset", "idWeight", "idType", "enhCompat", "noise_bias")
+
+
+def _seq_of(name):
+    # 取文件名里最后一段数字：gen_<hash>_00003_.png -> 3
+    nums = re.findall(r"\d+", str(name))
+    return int(nums[-1]) if nums else None
+
+
+def _slim_settings(s):
+    if not isinstance(s, dict):
+        return {}
+    out = {}
+    for k in RATING_SETTING_KEYS:
+        if k in s and s[k] not in (None, ""):
+            out[k] = s[k]
+    return out
+
+
+def load_ratings():
+    try:
+        with open(RATINGS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            try:
+                score = int(v.get("score") or 0)
+            except Exception:
+                continue
+            if not 1 <= score <= 5:
+                continue
+            out[k] = {"score": score, "prompt": v.get("prompt") or "",
+                      "negative": v.get("negative") or "",
+                      "seq": v.get("seq") if v.get("seq") is not None else _seq_of(k),
+                      "task": v.get("task") or "", "ts": v.get("ts") or 0,
+                      "settings": v.get("settings") or {}}
+        else:
+            try:
+                score = int(v)
+            except Exception:
+                continue
+            if 1 <= score <= 5:
+                out[k] = {"score": score, "prompt": "", "negative": "", "seq": _seq_of(k),
+                          "task": "", "ts": 0, "settings": {}}
+    return out
+
+
+def save_ratings(d):
+    with open(RATINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=1)
+
+
+def _rating_counts(d):
+    c = {str(i): 0 for i in range(1, 6)}
+    for v in d.values():
+        c[str(v["score"])] = c.get(str(v["score"]), 0) + 1
+    return c
+
+
+def _settings_line(s):
+    """把参数压成一行，便于导出后直接看/对比"""
+    if not isinstance(s, dict):
+        return ""
+    parts = []
+    loras = s.get("loras") or []
+    lora_txt = ",".join("%s:%s" % (str(l.get("name", "")).replace(".safetensors", ""), l.get("weight"))
+                        for l in loras if isinstance(l, dict))
+    for k in ("checkpoint", "vae", "steps", "cfg", "sampler", "scheduler", "seed",
+              "width", "height", "batch", "clip_skip", "denoise"):
+        if s.get(k) not in (None, ""):
+            parts.append("%s=%s" % (k, str(s.get(k)).replace(".safetensors", "")))
+    if lora_txt:
+        parts.append("loras=" + lora_txt)
+    nb = s.get("noise_bias") or {}
+    try:
+        bst = float(nb.get("strength") or 0)
+    except Exception:
+        bst = 0.0
+    if bst > 0:
+        parts.append("bias=%s%.2f" % (nb.get("mode") or "diff", bst))
+    return " ".join(parts)
+
+
+@app.route("/api/ratings")
+def api_ratings():
+    d = load_ratings()
+    return jsonify({"ok": True, "items": d, "counts": _rating_counts(d), "total": len(d)})
+
+
+@app.route("/api/rate", methods=["POST"])
+def api_rate():
+    """打分（1-5，score=0 取消），同时快照文件名/序号/提示词/生成参数/任务 id"""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("filename") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "no filename"})
+    try:
+        score = int(data.get("score") or 0)
+    except Exception:
+        return jsonify({"ok": False, "error": "bad score"})
+    if score and not 1 <= score <= 5:
+        return jsonify({"ok": False, "error": "score 需在 1-5"})
+    d = load_ratings()
+    if score:
+        old = d.get(name) or {}
+        settings = _slim_settings(data.get("settings")) or old.get("settings") or {}
+        d[name] = {
+            "score": score,
+            "prompt": str(data.get("prompt") or settings.get("prompt") or old.get("prompt") or "")[:4000],
+            "negative": str(data.get("negative") or settings.get("negative") or old.get("negative") or "")[:2000],
+            "seq": data.get("seq") if data.get("seq") is not None else old.get("seq", _seq_of(name)),
+            "task": str(data.get("task") or old.get("task") or "")[:64],
+            "ts": int(time.time()),
+            "settings": settings,
+        }
+    else:
+        d.pop(name, None)
+    save_ratings(d)
+    return jsonify({"ok": True, "filename": name, "score": score, "items": d,
+                    "counts": _rating_counts(d), "total": len(d)})
+
+
+@app.route("/api/ratings/export")
+def api_ratings_export():
+    d = load_ratings()
+    lines = ["# 图片评分清单（1-5 星）：分 \t 序号 \t 文件 \t 生成参数 \t 提示词",
+             "# 导出时间: " + time.strftime("%Y-%m-%d %H:%M:%S"),
+             "# 合计: %d 张" % len(d), ""]
+    for s in (5, 4, 3, 2, 1):
+        rows = sorted((kv for kv in d.items() if kv[1]["score"] == s),
+                      key=lambda kv: (kv[1].get("seq") if kv[1].get("seq") is not None else 0, kv[0]))
+        lines.append("## %d 星（%d 张）" % (s, len(rows)))
+        for name, v in rows:
+            lines.append("%d\t%s\t%s\t%s\t%s" % (
+                s, v.get("seq") if v.get("seq") is not None else "", name,
+                _settings_line(v.get("settings")), v.get("prompt") or ""))
+        lines.append("")
+    resp = app.response_class("\n".join(lines), mimetype="text/plain; charset=utf-8")
+    resp.headers["Content-Disposition"] = "attachment; filename=ratings.txt"
+    return resp
 
 
 @app.route("/api/triggers")
